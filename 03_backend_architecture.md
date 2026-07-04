@@ -7,7 +7,7 @@ The Arukin backend is built on Supabase, utilizing PostgreSQL, Row-Level Securit
 The core relational model connects **Managers** with **Members**.
 
 * **`managers`**: Stores profiles of admins/stewards logged into the dashboard. Contains fields like `tier` (FREE, PRO, TRIAL), `additional_slots`, and `pro_expires_at`.
-* **`members`**: Stores the target users who have connected their Google accounts. Contains the sensitive `access_token` and `google_refresh_token` used to proxy Google API requests, along with a foreign key (`manager_id`) linking them to their manager.
+* **`members`**: Stores the target users who have connected their Google accounts. Contains the sensitive `access_token` and `google_refresh_token` used to proxy Google API requests, along with a foreign key (`manager_id`) linking them to their manager. **Note:** Read access to these tokens is strictly denied to public roles via Column-Level Privileges (CLP).
 * **`audit_logs`**: An immutable tracking table for security compliance and transparency. Tracks actions like `TRASH_EMAIL` or `DOWNLOAD_FILE`.
 * **`usage_logs`**: Tracks API usage and scan frequencies for monthly rate limiting.
 * **`app_config`**: Global configuration variables.
@@ -22,8 +22,9 @@ PostgreSQL Functions exposed via Supabase RPC for client-side operations:
 
 ## Triggers & Automation
 
-Database triggers automate subscription tier cascading:
+Database triggers automate subscription tier cascading and security lifecycles:
 
+* **`trg_extract_oauth_tokens`**: When a member signs in (AFTER INSERT/UPDATE on `auth.identities`), this securely extracts the raw Google OAuth tokens on the server-side and upserts them into the `members` table, ensuring the frontend never holds the tokens.
 * **`trg_assign_member_tier`**: When a new member connects (BEFORE INSERT), it auto-sets their `tier` to match their manager's tier.
 * **`trg_update_members_tier`**: When a manager upgrades or downgrades (AFTER UPDATE), the new tier is automatically cascaded down to all associated members.
 

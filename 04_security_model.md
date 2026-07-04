@@ -2,16 +2,19 @@
 
 Security is paramount in Arukin, particularly because it handles highly sensitive email and drive data for at-risk individuals. The application implements a defense-in-depth approach.
 
-## 1. Token Isolation (API Proxying)
+## 1. Token Isolation & Secure Lifecycle
+The frontend **never** processes or holds Google OAuth tokens at any stage of the lifecycle:
+* **Write Path**: Tokens are extracted directly on the backend via a PostgreSQL trigger (`trg_extract_oauth_tokens`) on the `auth.identities` table when the user signs in.
+* **Read Path (API Proxying)**: The frontend utilizes a wrapper that calls Supabase Edge Functions (e.g., `google-proxy`). These edge functions inject the appropriate OAuth access tokens on the server side. 
+Sensitive Google OAuth tokens are completely hidden from the browser context, rendering XSS-based token theft impossible.
 
-The frontend **never** directly communicates with Google APIs. Instead, it utilizes a wrapper that calls Supabase Edge Functions (e.g., `google-proxy`). These edge functions inject the appropriate OAuth access tokens on the server side. Sensitive Google OAuth tokens are completely hidden from the browser context, rendering XSS-based token theft impossible.
+## 2. Row-Level Security (RLS) & Column-Level Privileges (CLP)
 
-## 2. Row-Level Security (RLS)
-
-The PostgreSQL database relies on strict RLS policies to enforce multi-tenant isolation:
+The PostgreSQL database relies on strict RLS and CLP policies to enforce multi-tenant isolation and data protection:
 
 * **Managers** can only read and update their own profile data, securely verified via `auth.jwt() ->> 'email'`.
-* **Members** and their sensitive tokens are strictly locked down. Managers can only view and interact with members that share their `manager_id`.
+* **Members** are strictly locked down. Managers can only view and interact with members that share their `manager_id`.
+* **Column-Level Privileges (CLP)**: Even if an RLS policy grants read access to a member's row, public roles (`anon` and `authenticated`) are explicitly `REVOKE`d from reading the `access_token` and `google_refresh_token` columns. Only the backend `service_role` can access them.
 * **Audit and Usage Logs** are similarly siloed, ensuring a manager can only ever view their own activity history.
 
 ## 3. Client-Side Encryption (IndexedDB)
