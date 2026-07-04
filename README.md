@@ -1,4 +1,4 @@
-# ArukinSec Enterprise Documentation
+# ArukinSec Documentation
 
 Welcome to the ArukinSec knowledge base. This documentation repository has been designed as an exhaustive, enterprise-grade architecture and operational handbook. It covers not just *how* the system works, but *why* specific design choices (ADRs) were made.
 
