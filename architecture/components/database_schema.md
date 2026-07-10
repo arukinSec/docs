@@ -1,61 +1,98 @@
 # Database Schema Architecture
 
-ArukinSec utilizes PostgreSQL, hosted on Supabase, as its primary datastore. The architecture relies heavily on PostgreSQL's relational integrity and Supabase's Row Level Security (RLS) to enforce strict multitenancy and access controls.
+Arukin uses PostgreSQL on Supabase as its primary datastore. The architecture relies on relational integrity, Row-Level Security (RLS) for multitenancy, Column-Level Privileges (CLP) for sensitive columns, and database triggers for backend-only token handling.
 
-## Overview
+## Current Tables
 
-The schema is designed to model the relationship between investigators (Managers) and their targets (Members), while strictly tracking system usage, access grants, and audit trails.
+### `managers`
+Represents the end-users of Arukin who conduct investigations.
 
-## Core Entities
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid | PK |
+| email | text | Unique, linked to Google OAuth |
+| role | text | Default 'manager' |
+| tier | text | FREE, TRIAL, PRO, LOCKED |
+| additional_slots | integer | Purchased overage slots |
+| billing_cycle | text | yearly, weekly |
+| pro_expires_at | timestamptz | PRO expiry |
+| razorpay_customer_id | text | Razorpay reference |
+| razorpay_subscription_id | text | Razorpay reference |
+| current_active_connections | integer | Denormalized count |
+| current_total_connections | integer | Denormalized count |
 
-### 1. Managers (`public.managers`)
-*(Note: Historically referred to as `auditors` in earlier migrations, renamed to `managers` in `20260704000010_rename_auditor_to_manager.sql`)*
-- **Purpose**: Represents the end-users of ArukinSec who conduct investigations.
-- **Key Columns**:
-  - `id` (UUID): Primary key.
-  - `email` (VARCHAR): The manager's email address.
-  - `tier` (VARCHAR): Current subscription tier (`FREE`, `TRIAL`, `PRO`).
-  - `additional_slots` (INT): Extra capacity for connecting members.
-- **Integration**: Managers are tightly coupled to Supabase Auth (`auth.users`).
+### `members`
+Represents the Google accounts being monitored.
 
-### 2. Members (`public.members`)
-- **Purpose**: Represents the targets (the connected Google accounts) being investigated.
-- **Key Columns**:
-  - `id` (UUID): Primary key.
-  - `manager_id` (UUID): Foreign key linking the member exclusively to a specific manager.
-  - `email`, `name`, `avatar_url`: Profile data fetched from Google.
-  - `provider_id` (TEXT): The Google unique ID.
-  - `access_token` (TEXT) & `google_refresh_token` (TEXT): The OAuth credentials required for the edge functions to proxy API requests.
-  - `tier` (VARCHAR): The capability tier granted to this member, dynamically assigned based on the manager's tier via database triggers.
+| Column | Type | Notes |
+|--------|------|-------|
+| id | uuid | PK |
+| email | text | Member's email |
+| name | text | Display name |
+| avatar_url | text | Google avatar |
+| provider_id | text | Google sub |
+| manager_id | uuid | FK -> managers.id |
+| access_token | text | Google OAuth access token — CLP-protected, service_role only |
+| google_refresh_token | text | Google OAuth refresh token — CLP-protected, service_role only |
+| tier | text | Capability tier, inherited from manager |
+| slot_no | integer | Slot assignment |
 
-### 3. Execution & Logging
-- **`public.scan_executions`**: Tracks the asynchronous status (e.g., `pending`, `running`, `completed`) of various intelligence gathering tasks.
-- **`public.audit_logs` & `public.usage_logs`**: Immutable ledgers that record significant actions (e.g., viewing an email, running a scan) for compliance and quota enforcement.
+### `scan_executions`
+Tracks async scan task status.
 
-## Security & Row Level Security (RLS)
+| Column | Type |
+|--------|------|
+| id | uuid |
+| manager_id | uuid |
+| member_id | uuid |
+| scan_category | text |
+| scan_depth | text |
+| status | text |
 
-ArukinSec employs a "Defense in Depth" strategy. We do not rely solely on application logic (API endpoints) to prevent unauthorized access. PostgreSQL RLS policies enforce boundaries at the lowest level.
+### `tiers`
+Defines subscription tier capabilities.
 
-**Key RLS Policies:**
-- **Manager Isolation**: `Managers can manage their own profile`
-  - Policy: `USING (LOWER(email) = LOWER(auth.jwt() ->> 'email'))`
-  - A manager can only read/update their own row in the `managers` table.
-- **Member Segregation**: `Managers can view and manage their connected members`
-  - Policy: `USING (manager_id IN (SELECT id FROM managers WHERE LOWER(email) = LOWER(auth.jwt() ->> 'email')))`
-  - A manager can only query members where the `manager_id` foreign key points to their own ID.
+| Column | Type |
+|--------|------|
+| id | uuid |
+| name | text |
+| base_max_active | integer |
+| base_max_total | integer |
+| slot_price_weekly | numeric |
+| slot_price_yearly | numeric |
 
-> [!WARNING]
-> Because RLS explicitly denies access by default, Edge Functions that require cross-tenant access (like webhooks) or background processing (like token refreshing) must use the `service_role` key to bypass RLS. These functions *must* manually re-implement authorization checks (e.g., verifying `member.manager_id == request.user.id`).
+### `app_config`
+Simple key-value configuration store.
 
-## Triggers & Functions (RPCs)
+| Column | Type |
+|--------|------|
+| key | text |
+| value | text |
 
-To maintain data integrity without requiring multiple round-trips from the client, we utilize PostgreSQL triggers and functions:
-- **`assign_member_tier_on_connect`**: A trigger that runs `BEFORE INSERT` on the `members` table to automatically inherit the tier capabilities of the parent `manager`.
-- **`update_members_tier_on_manager_upgrade`**: A trigger that runs `AFTER UPDATE OF tier` on `managers`, cascading subscription upgrades (or downgrades) to all associated members.
-- **`verify_manager_capacity`**: A callable RPC function used during the OAuth connection flow to atomically check if a manager has reached their allowed quota of connected members before granting access.
+## Security
 
-## Design Rationale (The "Why")
-- **Why store Google tokens in PostgreSQL instead of a separate vault?** 
-  Storing tokens on the `members` row allows us to use RLS to ensure a manager can never even read the token of a member they don't own. The Edge Functions retrieve the tokens server-side, preventing them from ever leaking to the client browser.
-- **Why rename Auditors to Managers?** 
-  The term "Auditor" implied a passive, read-only compliance role. As the application evolved into a proactive investigation and intelligence tool, "Manager" more accurately reflects the user's relationship with the connected accounts.
+### Row-Level Security (RLS)
+- **Manager isolation**: Each manager can only read/update their own row in `managers` (matched by `auth.jwt() ->> 'email'`).
+- **Member segregation**: Managers can only query members where `manager_id` matches their own ID.
+
+### Column-Level Privileges (CLP) — Token Protection
+Migration `20260705000000_secure_tokens_clp.sql` revokes SELECT on all columns of `members` from `anon`/`authenticated`, then re-grants SELECT only on safe columns. **`access_token` and `google_refresh_token` are explicitly omitted** from the grant. This means:
+- Client-side Supabase queries (`supabase.from('members').select(...)`) **cannot read token columns** even with a valid session.
+- Only `service_role` (used by Edge Functions) can read tokens.
+- This is enforced at the PostgreSQL column level, independent of RLS policies.
+
+### Token Write Path — Database Trigger
+Migration `20260705010000_secure_tokens_trigger.sql` creates a trigger `on_auth_identity_created_or_updated` on `auth.identities`. When a Google identity is created or updated, the trigger function `sync_identity_tokens_to_members()` extracts `provider_token` and `provider_refresh_token` from `identity_data` and upserts them into `public.members`. This runs as `SECURITY DEFINER`, bypassing RLS, so the frontend never needs to handle tokens.
+
+### Edge Function Authorization
+Edge Functions that need cross-tenant access (webhooks, token refresh) use the `service_role` key to bypass RLS. They manually verify authorization by checking `member.manager_id` against the authenticated manager's ID (`google-proxy/index.ts:53`).
+
+## Triggers & Functions
+- **`sync_identity_tokens_to_members`**: Trigger on `auth.identities` — syncs Google tokens to `members` table backend-side.
+- **`assign_member_tier_on_connect`**: BEFORE INSERT trigger on `members` — inherits tier from parent manager.
+- **`update_members_tier_on_manager_upgrade`**: AFTER UPDATE OF tier on `managers` — cascades tier changes to members.
+- **`verify_manager_capacity`**: RPC function that checks manager slot limits during OAuth connection.
+
+## Design Rationale
+- **Tokens in PostgreSQL, not vault**: Storing tokens on the `members` row with CLP protection allows Edge Functions to read them via `service_role` while keeping them invisible to client queries. This avoids the complexity of a separate vault service.
+- **Trigger-based token capture**: By syncing tokens through a DB trigger on `auth.identities`, the frontend is removed from the token write path entirely — tokens never transit the browser.

@@ -2,45 +2,32 @@
 
 ## Overview
 
-The `razorpay-webhook` Supabase Edge Function is responsible for asynchronously fulfilling purchases made via Razorpay. It listens for events such as `order.paid` or `payment.captured` and updates the database accordingly (upgrading the manager's tier or adding slots).
+The `razorpay-webhook` Edge Function (`supabase/functions/razorpay-webhook/index.ts`) fulfills purchases asynchronously. It listens for `order.paid` and `payment.captured` events, then upgrades the manager's tier or increments slots.
 
-## Payload Verification & Processing
+## Processing
 
-1. **Signature Verification:** 
-   The function extracts the `x-razorpay-signature` header and compares it against an HMAC SHA256 hash generated using the raw request body and the `RAZORPAY_WEBHOOK_SECRET`.
-   
-2. **Entity Extraction:**
-   It parses the payload to find either an `order` or `payment` entity.
-   It extracts the `orderId` and, critically, the metadata from the `notes` object (which was injected during the `create-subscription` step):
-   - `notes.manager_id`
-   - `notes.action`
-   - `notes.email`
+1. **Signature verification**: HMAC-SHA256 of the raw body, compared via `crypto.timingSafeEqual` using the `RAZORPAY_WEBHOOK_SECRET`.
+2. **Payload extraction**: Reads `orderId`, `manager_id`, `action`, and `email` from the `notes` object (injected during order creation).
+3. **Fulfillment**:
+   - `add-slot`: Calls `increment_manager_slots({ manager_uuid })` RPC.
+   - Others: Sets `tier = 'PRO'`, calculates `pro_expires_at` (7 or 365 days), updates `managers` table.
 
-3. **Fulfillment Logic:**
-   - **Add-on Slots (`action === 'add-slot'`):** Calls the Supabase RPC function `increment_manager_slots({ manager_uuid: managerId })`.
-   - **Pro Upgrades:** Calculates a new `pro_expires_at` date (7 days for weekly, 365 days for yearly) and updates the `managers` table, setting `tier = 'PRO'` and storing the `razorpay_subscription_id`.
+## Current Gap: No Idempotency
 
-## Critical Issue: Lack of Idempotency
+Razorpay may deliver the same webhook event more than once due to network retries. The current implementation does not track processed events:
 
-> [!CAUTION]
-> The current implementation of the `razorpay-webhook` **lacks proper idempotency logic**. Razorpay (and most payment gateways) explicitly state that webhooks may be delivered more than once for the same event due to network retries or distributed system behavior.
-
-### The Risks
-
-1. **Double Slot Allocation:**
-   If the webhook for an `add-slot` purchase is delivered twice, the script simply calls `increment_manager_slots` twice. This will result in the manager receiving 2 extra slots for the price of 1.
-   
-2. **Redundant Upgrade Processing:**
-   If an upgrade webhook is delivered twice, it executes the `UPDATE` query on the `managers` table twice. While this is less critical than double slot allocation (as it simply overwrites the same tier and expiration date), it is still inefficient and bad practice.
+- **Double slot allocation**: Two deliveries of an `add-slot` webhook call `increment_manager_slots` twice, granting 2 slots for the price of 1.
+- **Redundant upgrade**: Two deliveries of an upgrade event overwrite the same `pro_expires_at` — less critical but wasteful.
 
 ### Recommended Fix
 
-To achieve true idempotency, the system must track which orders have already been processed.
+Create a `processed_orders` table as a deduplication lock:
 
-**Solution 1: Order Processing Table (Recommended)**
-1. Create a table `processed_orders` with columns `order_id` (Primary Key, String) and `processed_at` (Timestamp).
-2. At the start of the webhook function, attempt to `INSERT INTO processed_orders (order_id)`. 
-3. If the insert fails due to a unique constraint violation, it means the order was already processed. The webhook should return a `200 OK` immediately without taking further action.
+```sql
+CREATE TABLE processed_orders (
+  order_id TEXT PRIMARY KEY,
+  processed_at TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-**Solution 2: RPC Modification**
-Modify the `increment_manager_slots` RPC to accept the `order_id` and handle the idempotency internally within a Postgres transaction, checking a log table before incrementing the integer.
+At the start of the webhook handler, `INSERT INTO processed_orders (order_id)`. If the insert violates the primary key, return 200 OK immediately — the order was already processed.
